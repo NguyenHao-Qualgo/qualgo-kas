@@ -4,35 +4,25 @@ header:
     - kas/include/base.yml
     - kas/include/tegra.yml
     - kas/include/swupdate.yml
+    - kas/include/ros.yml
+    - kas/include/qualgo.yml
 
 machine: jetson-orin-nano-devkit-nvme
+target:
+  - demo-image-base
 
 defaults:
   repos:
     branch: scarthgap
 
 local_conf_header:
-  swupdate-tegra: |
+  tegra: |
     IMAGE_INSTALL:append = " swupdate"
     USE_REDUNDANT_FLASH_LAYOUT = "1"
     IMAGE_FSTYPES:append = " tar.gz"
     SWUPDATE_CORE_IMAGE_NAME ?= "demo-image-base"
-
-  tegra: |
     INHERIT:remove = "tegra-support-sanity distro_layer_buildinfo"
     EXTRA_IMAGE_FEATURES ?= "allow-empty-password empty-root-password allow-root-login"
-
-  # dm-verity: |
-  #   IMAGE_CLASSES += "dm-verity-img"
-    
-  #   IMAGE_FSTYPES += "tegraflash ext4.verity"
-    
-  #   DM_VERITY_IMAGE = "core-image-minimal"
-  #   DM_VERITY_IMAGE_TYPE = "ext4"
-    
-  #   INITRAMFS_IMAGE = "core-image-minimal-initramfs"
-  #   INITRAMFS_IMAGE_BUNDLE = "1"
-    
-  #   PACKAGE_INSTALL:append:pn-core-image-minimal-initramfs = " initramfs-module-dmverity"
-    
-  #   KERNEL_FEATURES:append = " features/device-mapper/dm-verity.scc"
+    INHERIT += "rm_work"
+    PARALLEL_MAKE = " -j 4"
+    BB_NUMBER_THREADS = " 4"

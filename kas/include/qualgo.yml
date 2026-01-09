@@ -1,0 +1,49 @@
+header:
+  version: 14
+
+distro: qualgo
+
+repos:
+  uav-qualgo:
+    layers:
+      layers/meta-edk2:
+      layers/meta-skytrack-kernel:
+      layers/meta-skytrack-secureboot:
+
+  meta-rtlwifi:
+    path: repos/meta-rtlwifi
+    url: https://github.com/EmbeddedAndroid/meta-rtlwifi
+    branch: master
+
+local_conf_header:
+  secure-boot: |
+    SECUREBOOT_KEYS_DIR ?= "${TOPDIR}/../uefi_keys"
+    SECUREBOOT_PK_KEY   = "${SECUREBOOT_KEYS_DIR}/PK.key"
+    SECUREBOOT_PK_CERT  = "${SECUREBOOT_KEYS_DIR}/PK.crt"
+    SECUREBOOT_KEK_KEY  = "${SECUREBOOT_KEYS_DIR}/KEK.key"
+    SECUREBOOT_KEK_CERT = "${SECUREBOOT_KEYS_DIR}/KEK.crt"
+    SECUREBOOT_DB_ESL   = "${SECUREBOOT_KEYS_DIR}/db.esl"
+    SECUREBOOT_DB_AUTH  = "${SECUREBOOT_KEYS_DIR}/db.auth"
+
+    UEFI1_DB_KEY   = "${SECUREBOOT_KEYS_DIR}/sign-uefi1.key"
+    UEFI1_DB_CERT  = "${SECUREBOOT_KEYS_DIR}/sign-uefi1.crt"
+
+    UEFI2_DB_KEY   = "${SECUREBOOT_KEYS_DIR}/sign-uefi2.key"
+    UEFI2_DB_CERT  = "${SECUREBOOT_KEYS_DIR}/sign-uefi2.crt"
+
+    KERNEL_DB_KEY  = "${SECUREBOOT_KEYS_DIR}/sign-kernel.key"
+    KERNEL_DB_CERT = "${SECUREBOOT_KEYS_DIR}/sign-kernel.crt"
+
+    IMAGE_INSTALL:append = " \
+      secureboot-keys \
+      util-linux \
+      apt \
+    "
+
+    IMAGE_INSTALL:append = " cuda-toolkit cuda-samples"
+
+    EXTRA_IMAGE_FEATURES ?= "debug-tweaks"
+
+    IMAGE_INSTALL:remove = " dropbear"
+
+    QUALGO_BOOTFLOW = "nvidia"

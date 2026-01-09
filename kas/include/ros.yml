@@ -1,0 +1,12 @@
+header:
+  version: 14
+
+repos:
+  meta-ros:
+    url: https://github.com/ros/meta-ros.git
+    path: repos/meta-ros
+    layers:
+      meta-ros-common:
+      meta-ros2:
+      meta-ros2-jazzy:
+      # meta-ros-init: located somewhere else?
