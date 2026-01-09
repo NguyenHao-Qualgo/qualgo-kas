@@ -7,6 +7,7 @@ header:
     - kas/include/ros.yml
     - kas/include/qualgo.yml
 
+distro: tegrademo
 machine: jetson-orin-nano-devkit-nvme
 target:
   - demo-image-base
@@ -23,6 +24,6 @@ local_conf_header:
     SWUPDATE_CORE_IMAGE_NAME ?= "demo-image-base"
     INHERIT:remove = "tegra-support-sanity distro_layer_buildinfo"
     EXTRA_IMAGE_FEATURES ?= "allow-empty-password empty-root-password allow-root-login"
-    INHERIT += "rm_work"
+    # INHERIT += "rm_work"
     PARALLEL_MAKE = " -j 4"
     BB_NUMBER_THREADS = " 4"

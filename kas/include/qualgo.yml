@@ -1,8 +1,6 @@
 header:
   version: 14
 
-distro: qualgo
-
 repos:
   uav-qualgo:
     layers:
@@ -46,4 +44,4 @@ local_conf_header:
 
     IMAGE_INSTALL:remove = " dropbear"
 
-    QUALGO_BOOTFLOW = "nvidia"
+    IMAGE_INSTALL:append = " edk2-bootloader-firmware uefi1-prebuilt"
