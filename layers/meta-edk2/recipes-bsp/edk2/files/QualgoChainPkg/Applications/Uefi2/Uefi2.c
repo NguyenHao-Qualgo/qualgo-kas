@@ -1,23 +1,30 @@
 /*
-    Uefi2.c - Second-stage UEFI loader (kernel + initrd via LINUX_EFI_INITRD_MEDIA_GUID)
+    Uefi2.c - Second-stage UEFI loader (kernel + optional initrd via LINUX_EFI_INITRD_MEDIA_GUID)
+
     Chain:
       Firmware -> uefi1.efi (decrypts uefi2) -> uefi2.efi -> Linux kernel Image
+
     This loader does the following:
-      1) Enumerates all Simple File System handles and finds the one
-         that contains \boot\Image.
+      1) Enumerates all Simple File System handles and finds the one that contains \boot\Image.
       2) Loads the Linux kernel Image from \boot\Image into memory.
-      3) Loads an initrd from \boot\initrd into memory.
-      4) Exposes the initrd via EFI_LOAD_FILE2 + LINUX_EFI_INITRD_MEDIA_GUID.
-      5) Constructs a MemMap Device Path (DP) for the in-memory kernel.
-      6) Calls LoadImage()/StartImage() with that MemMap DP.
+      3) Optionally loads initrd from \boot\initrd into memory.
+      4) If initrd is present, exposes it via EFI_LOAD_FILE2 + LINUX_EFI_INITRD_MEDIA_GUID.
+      5) Constructs a MemMap Device Path for the in-memory kernel.
+      6) Calls LoadImage()/StartImage() for the kernel EFI stub.
       7) Sets the kernel command line via LOADED_IMAGE.LoadOptions.
+
+    Policy:
+      - If BOOT=PXE is present in LoadOptions (passed from uefi1), use NFS cmdline and SKIP initrd.
+      - Otherwise, use local cmdline and load initrd from local FS.
 */
 
 #include <Uefi.h>
+
 #include <Library/UefiLib.h>
 #include <Library/UefiBootServicesTableLib.h>
 #include <Library/BaseMemoryLib.h>
 #include <Library/DevicePathLib.h>
+#include <Library/BaseLib.h>
 
 #include <Protocol/LoadedImage.h>
 #include <Protocol/SimpleFileSystem.h>
@@ -27,9 +34,23 @@
 #include <Guid/FileInfo.h>
 #include <Guid/LinuxEfiInitrdMedia.h>
 
-/* Path for kernel Image and initrd on the root filesystem */
-#define KERNEL_PATH L"\\boot\\Image"
-#define INITRD_PATH L"\\boot\\initrd"
+/* Paths for kernel Image and initrd on the root filesystem */
+#define KERNEL_PATH   L"\\boot\\Image"
+#define INITRD_PATH   L"\\boot\\initrd"
+
+/* BOOT mode tags (passed from uefi1 via LoadOptions) */
+#define BOOTOPT_PXE   L"BOOT=PXE"
+#define BOOTOPT_FS    L"BOOT=FS"
+
+/* NFS server/export (adjust if needed) */
+#define NFS_SERVER_IP   L"192.168.42.1"
+#define NFS_ROOT_EXPORT L"/volume1/nfs_root"
+
+/* Logging helpers */
+#define LOG_PREFIX L"[uefi2] "
+#define LOGI(fmt, ...)  Print(LOG_PREFIX fmt L"\n", ##__VA_ARGS__)
+#define LOGW(fmt, ...)  Print(LOG_PREFIX L"WARN: "  fmt L"\n", ##__VA_ARGS__)
+#define LOGE(fmt, ...)  Print(LOG_PREFIX L"ERROR: " fmt L"\n", ##__VA_ARGS__)
 
 #pragma pack(push, 1)
 typedef struct {
@@ -49,18 +70,18 @@ static LINUX_INITRD_DEVICE_PATH mInitrdDevPath = {
         {
             MEDIA_DEVICE_PATH,
             MEDIA_VENDOR_DP,
-            { sizeof (VENDOR_DEVICE_PATH), 0 }
+            { sizeof(VENDOR_DEVICE_PATH), 0 }
         },
         LINUX_EFI_INITRD_MEDIA_GUID
     },
     {
         END_DEVICE_PATH_TYPE,
         END_ENTIRE_DEVICE_PATH_SUBTYPE,
-        { sizeof (EFI_DEVICE_PATH_PROTOCOL), 0 }
+        { sizeof(EFI_DEVICE_PATH_PROTOCOL), 0 }
     }
 };
 
-/* Kernel command line. */
+/* Local-root cmdline (NVMe example) */
 static CONST CHAR16 KernelCmdline[] =
     L"root=/dev/nvme0n1p1 rw rootwait rootdelay=10 rootfstype=ext4 "
     L"mminit_loglevel=4 "
@@ -68,6 +89,16 @@ static CONST CHAR16 KernelCmdline[] =
     L"firmware_class.path=/etc/firmware "
     L"fbcon=map:0 net.ifnames=0 nospectre_bhb "
     L"video=efifb:off console=tty0";
+
+/* NFS-root cmdline (PXE/NFS). Note: we intentionally skip initrd for NFS-root to avoid switch_root issues. */
+static CONST CHAR16 KernelCmdlineNfs[] =
+    L"ip=dhcp "
+    L"root=/dev/nfs rw "
+    L"nfsroot=" NFS_SERVER_IP L":" NFS_ROOT_EXPORT L",vers=4,tcp "
+    L"console=ttyTCU0,115200n8 console=tty0 "
+    L"firmware_class.path=/etc/firmware "
+    L"net.ifnames=0 "
+    L"loglevel=7";
 
 /* Context for EFI_LOAD_FILE2 protocol (initrd provider) */
 typedef struct {
@@ -78,7 +109,9 @@ typedef struct {
 
 static INITRD_LOADFILE2_CTX mInitrdLf2;
 
-/* LoadFile2 callback: Linux EFI stub calls this to receive the initrd.*/
+/*
+  LoadFile2 callback: Linux EFI stub calls this to receive the initrd.
+*/
 static EFI_STATUS EFIAPI
 InitrdLoadFile(
     IN EFI_LOAD_FILE2_PROTOCOL  *This,
@@ -94,6 +127,10 @@ InitrdLoadFile(
         return EFI_INVALID_PARAMETER;
     }
 
+    if (Ctx->InitrdBuffer == NULL || Ctx->InitrdSize == 0) {
+        return EFI_NOT_FOUND;
+    }
+
     if (Buffer == NULL || *BufferSize < Ctx->InitrdSize) {
         *BufferSize = Ctx->InitrdSize;
         return EFI_BUFFER_TOO_SMALL;
@@ -105,7 +142,9 @@ InitrdLoadFile(
     return EFI_SUCCESS;
 }
 
-/* Load an entire file into an allocated buffer from the given Root.*/
+/*
+  Load an entire file into an allocated buffer from the given Root.
+*/
 static EFI_STATUS
 LoadFileToBuffer(
     IN  EFI_FILE_PROTOCOL  *Root,
@@ -119,6 +158,10 @@ LoadFileToBuffer(
     EFI_FILE_INFO     *FileInfo = NULL;
     UINTN              InfoSize = 0;
 
+    if (Buffer == NULL || BufferSize == NULL || Root == NULL || Path == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+
     *Buffer     = NULL;
     *BufferSize = 0;
 
@@ -130,27 +173,27 @@ LoadFileToBuffer(
         0
     );
     if (EFI_ERROR(Status)) {
-        Print(L"[uefi2] LoadFileToBuffer: failed to open %s: %r\n", Path, Status);
+        LOGW(L"Open(%s) failed: %r", Path, Status);
         return Status;
     }
 
     Status = File->GetInfo(File, &gEfiFileInfoGuid, &InfoSize, NULL);
     if (Status != EFI_BUFFER_TOO_SMALL) {
-        Print(L"[uefi2] GetInfo(size) failed for %s: %r\n", Path, Status);
+        LOGE(L"GetInfo(size) failed for %s: %r", Path, Status);
         File->Close(File);
         return Status;
     }
 
     Status = gBS->AllocatePool(EfiLoaderData, InfoSize, (VOID **)&FileInfo);
     if (EFI_ERROR(Status)) {
-        Print(L"[uefi2] AllocatePool(FileInfo) failed: %r\n", Status);
+        LOGE(L"AllocatePool(FileInfo) failed: %r", Status);
         File->Close(File);
         return Status;
     }
 
     Status = File->GetInfo(File, &gEfiFileInfoGuid, &InfoSize, FileInfo);
     if (EFI_ERROR(Status)) {
-        Print(L"[uefi2] GetInfo(info) failed for %s: %r\n", Path, Status);
+        LOGE(L"GetInfo(info) failed for %s: %r", Path, Status);
         gBS->FreePool(FileInfo);
         File->Close(File);
         return Status;
@@ -161,7 +204,7 @@ LoadFileToBuffer(
 
     Status = gBS->AllocatePool(EfiLoaderData, *BufferSize, Buffer);
     if (EFI_ERROR(Status)) {
-        Print(L"[uefi2] AllocatePool(file buffer) failed: %r\n", Status);
+        LOGE(L"AllocatePool(file buffer) failed for %s: %r", Path, Status);
         File->Close(File);
         return Status;
     }
@@ -170,21 +213,21 @@ LoadFileToBuffer(
     File->Close(File);
 
     if (EFI_ERROR(Status)) {
-        Print(L"[uefi2] Read() failed for %s: %r\n", Path, Status);
+        LOGE(L"Read(%s) failed: %r", Path, Status);
         gBS->FreePool(*Buffer);
         *Buffer     = NULL;
         *BufferSize = 0;
         return Status;
     }
 
+    LOGI(L"Loaded %s at 0x%lx size=%u", Path, (UINT64)(UINTN)(*Buffer), (UINT32)(*BufferSize));
     return EFI_SUCCESS;
 }
 
 /*
- Enumerate all Simple File System handles and find one that contains KERNEL_PATH.
- On success, RootOut is an open EFI_FILE_PROTOCOL for the root of that filesystem.
+  Enumerate all SimpleFS handles and find one that contains KERNEL_PATH.
+  On success, RootOut is an open EFI_FILE_PROTOCOL for the root of that filesystem.
 */
-
 static EFI_STATUS
 FindBootFileSystem(
     OUT EFI_FILE_PROTOCOL **RootOut
@@ -197,8 +240,10 @@ FindBootFileSystem(
     EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *Sfsp;
     EFI_FILE_PROTOCOL               *Root;
     EFI_FILE_PROTOCOL               *TestFile;
-    EFI_DEVICE_PATH_PROTOCOL        *DevicePath;
 
+    if (RootOut == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
     *RootOut = NULL;
 
     Status = gBS->LocateHandleBuffer(
@@ -209,42 +254,44 @@ FindBootFileSystem(
         &HandleBuffer
     );
     if (EFI_ERROR(Status)) {
-        Print(L"[uefi2] LocateHandleBuffer(SimpleFS) failed: %r\n", Status);
+        LOGE(L"LocateHandleBuffer(SimpleFS) failed: %r", Status);
         return Status;
     }
 
-    Print(L"[uefi2] Found %u SimpleFS handles\n", HandleCount);
+    LOGI(L"Found %u SimpleFS handles", (UINT32)HandleCount);
 
     for (Index = 0; Index < HandleCount; Index++) {
+        EFI_DEVICE_PATH_PROTOCOL *Dp = NULL;
+
+        Status = gBS->HandleProtocol(
+            HandleBuffer[Index],
+            &gEfiDevicePathProtocolGuid,
+            (VOID**)&Dp
+        );
+        if (!EFI_ERROR(Status) && Dp != NULL) {
+            CHAR16 *Txt = ConvertDevicePathToText(Dp, FALSE, FALSE);
+            if (Txt != NULL) {
+                LOGI(L"FS[%u] DP: %s", (UINT32)Index, Txt);
+                gBS->FreePool(Txt);
+            }
+        }
+
         Status = gBS->HandleProtocol(
             HandleBuffer[Index],
             &gEfiSimpleFileSystemProtocolGuid,
             (VOID**)&Sfsp
         );
-        if (EFI_ERROR(Status)) {
-            Print(L"[uefi2] HandleProtocol(SimpleFS) failed for handle #%u: %r\n", Index, Status);
+        if (EFI_ERROR(Status) || Sfsp == NULL) {
+            LOGW(L"HandleProtocol(SimpleFS) failed for FS[%u]: %r", (UINT32)Index, Status);
             continue;
-        }
-
-        // Get device path for logging
-        Status = gBS->HandleProtocol(
-            HandleBuffer[Index],
-            &gEfiDevicePathProtocolGuid,
-            (VOID**)&DevicePath
-        );
-        if (!EFI_ERROR(Status)) {
-            Print(L"[uefi2] Checking filesystem #%u: %s\n", Index, ConvertDevicePathToText(DevicePath, FALSE, FALSE));
-        } else {
-            Print(L"[uefi2] Checking filesystem #%u (no device path)\n", Index);
         }
 
         Status = Sfsp->OpenVolume(Sfsp, &Root);
-        if (EFI_ERROR(Status)) {
-            Print(L"[uefi2] OpenVolume failed for handle #%u: %r\n", Index, Status);
+        if (EFI_ERROR(Status) || Root == NULL) {
+            LOGW(L"OpenVolume failed for FS[%u]: %r", (UINT32)Index, Status);
             continue;
         }
 
-        // Try to open \boot\Image on this filesystem
         Status = Root->Open(
             Root,
             &TestFile,
@@ -252,29 +299,57 @@ FindBootFileSystem(
             EFI_FILE_MODE_READ,
             0
         );
+
         if (!EFI_ERROR(Status)) {
-            // We found a filesystem that contains the kernel
             TestFile->Close(TestFile);
             *RootOut = Root;
 
-            Print(L"[uefi2] Found %s on filesystem handle #%u\n",
-                  KERNEL_PATH, Index);
+            LOGI(L"Found %s on filesystem handle #%u", KERNEL_PATH, (UINT32)Index);
             gBS->FreePool(HandleBuffer);
             return EFI_SUCCESS;
-        } else {
-            Print(L"[uefi2] %s not found on filesystem #%u: %r\n", KERNEL_PATH, Index, Status);
         }
-        // This filesystem does not contain the kernel; continue searching
+
+        LOGI(L"%s not found on FS[%u]: %r", KERNEL_PATH, (UINT32)Index, Status);
+        // Root handle remains open; close it to avoid handle leaks
+        Root->Close(Root);
     }
 
     gBS->FreePool(HandleBuffer);
-    Print(L"[uefi2] Could not find %s on any filesystem\n", KERNEL_PATH);
+    LOGE(L"Could not find %s on any filesystem", KERNEL_PATH);
     return EFI_NOT_FOUND;
+}
+
+STATIC
+BOOLEAN
+IsNetworkBoot(IN EFI_HANDLE ImageHandle)
+{
+    EFI_LOADED_IMAGE_PROTOCOL *Li = NULL;
+    EFI_STATUS Status;
+
+    Status = gBS->HandleProtocol(ImageHandle, &gEfiLoadedImageProtocolGuid, (VOID**)&Li);
+    if (EFI_ERROR(Status) || Li == NULL) {
+        LOGW(L"HandleProtocol(LoadedImage) failed: %r", Status);
+        return FALSE;
+    }
+
+    if (Li->LoadOptions == NULL || Li->LoadOptionsSize < sizeof(CHAR16)) {
+        LOGI(L"No LoadOptions from uefi1 (assume Local)");
+        return FALSE;
+    }
+
+    CONST CHAR16 *Opts = (CONST CHAR16*)Li->LoadOptions;
+
+    LOGI(L"Received LoadOptionsSize=%u", (UINT32)Li->LoadOptionsSize);
+    LOGI(L"Received LoadOptions: %s", Opts);
+
+    return (StrStr(Opts, BOOTOPT_PXE) != NULL);
 }
 
 static EFI_STATUS
 LoadAndStartKernelFromAnyFs(
-    IN EFI_HANDLE ImageHandle
+    IN EFI_HANDLE     ImageHandle,
+    IN CONST CHAR16  *Cmdline,
+    IN BOOLEAN        UseInitrd
     )
 {
     EFI_STATUS                   Status;
@@ -285,40 +360,46 @@ LoadAndStartKernelFromAnyFs(
     UINTN                        InitrdSize    = 0;
     MEMMAP_DEVICE_PATH_WITH_END  KernelDp;
     EFI_HANDLE                   KernelHandle  = NULL;
-    EFI_LOADED_IMAGE_PROTOCOL   *KernelLoadedImage;
+    EFI_LOADED_IMAGE_PROTOCOL   *KernelLoadedImage = NULL;
     EFI_HANDLE                   InitrdHandle  = NULL;
 
-    Print(L"[uefi2] LoadAndStartKernelFromAnyFs() entered\n");
+    LOGI(L"LoadAndStartKernelFromAnyFs() entered");
+    LOGI(L"Searching for filesystem containing %s", KERNEL_PATH);
 
-    /* 1) Find the filesystem that contains \boot\Image */
-    Print(L"[uefi2] Searching for filesystem containing %s\n", KERNEL_PATH);
     Status = FindBootFileSystem(&Root);
     if (EFI_ERROR(Status) || Root == NULL) {
-        Print(L"[uefi2] FindBootFileSystem() failed: %r\n", Status);
+        LOGE(L"FindBootFileSystem() failed: %r", Status);
         return Status;
     }
 
-    /* 2) Load kernel Image file into memory */
+    /* Load kernel */
     Status = LoadFileToBuffer(Root, KERNEL_PATH, &KernelBuffer, &KernelSize);
     if (EFI_ERROR(Status)) {
-        Print(L"[uefi2] Failed to load kernel %s: %r\n", KERNEL_PATH, Status);
+        LOGE(L"Failed to load kernel %s: %r", KERNEL_PATH, Status);
+        Root->Close(Root);
         return Status;
     }
 
-    Print(L"[uefi2] Loaded kernel %s at 0x%lx, size %u bytes\n",
-          KERNEL_PATH, (UINT64)(UINTN)KernelBuffer, (UINT32)KernelSize);
+    LOGI(L"Kernel loaded at 0x%lx size=%u", (UINT64)(UINTN)KernelBuffer, (UINT32)KernelSize);
 
-    /* 3) Load initrd from the same filesystem */
-    Status = LoadFileToBuffer(Root, INITRD_PATH, &InitrdBuffer, &InitrdSize);
-    if (EFI_ERROR(Status)) {
-        Print(L"[uefi2] Failed to load initrd %s: %r (continuing without initrd)\n", INITRD_PATH, Status);
-        InitrdSize = 0;  // Continue without initrd
+    /* Load initrd optionally */
+    if (UseInitrd) {
+        Status = LoadFileToBuffer(Root, INITRD_PATH, &InitrdBuffer, &InitrdSize);
+        if (EFI_ERROR(Status)) {
+            LOGW(L"Initrd %s not loaded: %r (booting without initrd)", INITRD_PATH, Status);
+            InitrdBuffer = NULL;
+            InitrdSize   = 0;
+        } else {
+            LOGI(L"Initrd loaded at 0x%lx size=%u", (UINT64)(UINTN)InitrdBuffer, (UINT32)InitrdSize);
+        }
     } else {
-        Print(L"[uefi2] Loaded initrd %s at 0x%lx, size %u bytes\n",
-              INITRD_PATH, (UINT64)(UINTN)InitrdBuffer, (UINT32)InitrdSize);
+        LOGI(L"Skipping initrd (network/NFS boot)");
     }
 
-    /* 4) Register initrd via EFI_LOAD_FILE2 + LINUX_EFI_INITRD_MEDIA_GUID (only if present) */
+    /* Close Root now (we already loaded files into RAM) */
+    Root->Close(Root);
+
+    /* Register initrd (only if present) */
     if (InitrdSize > 0) {
         ZeroMem(&mInitrdLf2, sizeof(mInitrdLf2));
         mInitrdLf2.Proto.LoadFile = InitrdLoadFile;
@@ -332,15 +413,19 @@ LoadAndStartKernelFromAnyFs(
             NULL
         );
         if (EFI_ERROR(Status)) {
-            Print(L"[uefi2] Failed to install INITRD LoadFile2: %r\n", Status);
+            LOGE(L"InstallMultipleProtocolInterfaces(initrd) failed: %r", Status);
+            // Cleanup kernel buffer before returning
+            gBS->FreePool(KernelBuffer);
+            if (InitrdBuffer) gBS->FreePool(InitrdBuffer);
             return Status;
         }
 
-        Print(L"[uefi2] Initrd registered via LINUX_EFI_INITRD_MEDIA_GUID (size=%u bytes)\n",
-              (UINT32)InitrdSize);
+        LOGI(L"Initrd registered via LINUX_EFI_INITRD_MEDIA_GUID (size=%u)", (UINT32)InitrdSize);
     }
 
-    /* 5) Construct MemMap Device Path for the in-memory kernel image*/
+    /* Build MemMap DP for kernel image in memory */
+    ZeroMem(&KernelDp, sizeof(KernelDp));
+
     KernelDp.MemMap.Header.Type    = HARDWARE_DEVICE_PATH;
     KernelDp.MemMap.Header.SubType = HW_MEMMAP_DP;
 
@@ -352,15 +437,14 @@ LoadAndStartKernelFromAnyFs(
 
     KernelDp.MemMap.MemoryType      = EfiLoaderData;
     KernelDp.MemMap.StartingAddress = (EFI_PHYSICAL_ADDRESS)(UINTN)KernelBuffer;
-    KernelDp.MemMap.EndingAddress   =
-        KernelDp.MemMap.StartingAddress + (KernelSize - 1);
+    KernelDp.MemMap.EndingAddress   = KernelDp.MemMap.StartingAddress + (KernelSize - 1);
 
     KernelDp.End.Type      = END_DEVICE_PATH_TYPE;
     KernelDp.End.SubType   = END_ENTIRE_DEVICE_PATH_SUBTYPE;
     KernelDp.End.Length[0] = (UINT8)sizeof(EFI_DEVICE_PATH_PROTOCOL);
     KernelDp.End.Length[1] = 0;
 
-    /* 6) Load the kernel as an EFI image from memory via MemMap DP */
+    /* Load kernel as EFI image (Linux EFI stub) */
     Status = gBS->LoadImage(
         FALSE,
         ImageHandle,
@@ -370,49 +454,60 @@ LoadAndStartKernelFromAnyFs(
         &KernelHandle
     );
     if (EFI_ERROR(Status)) {
-        Print(L"[uefi2] LoadImage(kernel via MemMap DP) failed: %r\n", Status);
+        LOGE(L"LoadImage(kernel via MemMap DP) failed: %r", Status);
+        gBS->FreePool(KernelBuffer);
+        if (InitrdBuffer) gBS->FreePool(InitrdBuffer);
         return Status;
     }
 
-    /* 7) Set kernel command line via LOADED_IMAGE.LoadOptions */
+    /* Set kernel cmdline */
     Status = gBS->HandleProtocol(
         KernelHandle,
         &gEfiLoadedImageProtocolGuid,
         (VOID**)&KernelLoadedImage
     );
-    if (EFI_ERROR(Status)) {
-        Print(L"[uefi2] HandleProtocol(LoadedImage for kernel) failed: %r\n", Status);
+    if (EFI_ERROR(Status) || KernelLoadedImage == NULL) {
+        LOGE(L"HandleProtocol(LoadedImage for kernel) failed: %r", Status);
         return Status;
     }
 
-    KernelLoadedImage->LoadOptions     = (VOID *)KernelCmdline;
-    KernelLoadedImage->LoadOptionsSize =
-        (UINT32)((StrLen(KernelCmdline) + 1) * sizeof(CHAR16));
+    KernelLoadedImage->LoadOptions     = (VOID *)Cmdline;
+    KernelLoadedImage->LoadOptionsSize = (UINT32)((StrLen(Cmdline) + 1) * sizeof(CHAR16));
 
-    Print(L"[uefi2] Using kernel cmdline: %s\n", KernelCmdline);
-    Print(L"[uefi2] Starting kernel Image...\n");
+    LOGI(L"Using kernel cmdline: %s", Cmdline);
+    LOGI(L"Starting kernel Image...");
 
-    /* 8) Start the kernel image. Normally we do not return if Linux boots. */
-    Status = gBS->StartImage(
-        KernelHandle,
-        NULL,
-        NULL
-    );
+    /* Start kernel */
+    Status = gBS->StartImage(KernelHandle, NULL, NULL);
 
-    Print(L"[uefi2] StartImage(kernel) returned: %r\n", Status);
+    LOGW(L"StartImage(kernel) returned: %r", Status);
     return Status;
 }
 
 EFI_STATUS EFIAPI
-UefiMain (
+UefiMain(
     IN EFI_HANDLE        ImageHandle,
     IN EFI_SYSTEM_TABLE  *SystemTable
     )
 {
     EFI_STATUS Status;
+    BOOLEAN    NetBoot;
+    CONST CHAR16 *Cmdline;
+    BOOLEAN    UseInitrd;
 
-    Print(L"[uefi2] UefiMain() start\n");
-    Status = LoadAndStartKernelFromAnyFs(ImageHandle);
-    Print(L"[uefi2] UefiMain() exit: %r\n", Status);
+    LOGI(L"UefiMain() start");
+
+    NetBoot = IsNetworkBoot(ImageHandle);
+    LOGI(L"Boot source: %s", NetBoot ? L"PXE/Network" : L"Local FS");
+
+    Cmdline   = NetBoot ? KernelCmdlineNfs : KernelCmdline;
+    UseInitrd = NetBoot ? FALSE            : TRUE;
+
+    LOGI(L"UseInitrd=%d", UseInitrd ? 1 : 0);
+    LOGI(L"Selected cmdline: %s", Cmdline);
+
+    Status = LoadAndStartKernelFromAnyFs(ImageHandle, Cmdline, UseInitrd);
+
+    LOGI(L"UefiMain() exit: %r", Status);
     return Status;
 }

@@ -46,6 +46,7 @@
 #include <Protocol/Ip4.h>  
 #include <Protocol/PxeBaseCode.h>
 
+#define STAGE2_ENC_TFTP_PATH  "efi/secondLoader.enc"
 
 #define UEFI2_ENC_PATH L"\\EFI\\BOOT\\secondLoader.enc"
 
@@ -293,15 +294,15 @@ DecryptUefi2(
 
 STATIC
 EFI_STATUS
-PxeTftpReadFile(
-    IN  CONST UINT8 *FileNameAscii,   // NOTE: UINT8*, not CHAR8*
+PxeTftpDownloadFile(
+    IN  CONST UINT8 *FileNameAscii,
     OUT VOID        **FileBuffer,
     OUT UINTN       *FileSize
     )
 {
     EFI_STATUS                  Status;
     EFI_PXE_BASE_CODE_PROTOCOL *Pxe = NULL;
-    EFI_IP_ADDRESS              ServerIp;   // NOTE: EFI_IP_ADDRESS
+    EFI_IP_ADDRESS              ServerIp;
     VOID                       *Buf = NULL;
     UINTN                       BufSize;
 
@@ -327,20 +328,14 @@ PxeTftpReadFile(
 
     ZeroMem(&ServerIp, sizeof(ServerIp));
 
-    //
-    // Most Jetson PXE setups are IPv4.
-    // BootpSiAddr is the DHCP "siaddr" (next-server).
-    //
     if (!Pxe->Mode->UsingIpv6) {
-        // BootpSiAddr is 4 bytes (IPv4). Copy into EFI_IP_ADDRESS.v4
         CopyMem(&ServerIp.v4, Pxe->Mode->DhcpAck.Dhcpv4.BootpSiAddr, sizeof(ServerIp.v4));
     } else {
-        // If you really use IPv6 PXE, you'll need to adapt this part to your DHCPv6 struct fields.
+        // TODO
         Print(L"[uefi1] IPv6 PXE mode detected; DHCPv6 server IP extraction not implemented.\n");
         return EFI_UNSUPPORTED;
     }
 
-    // Start with 4MiB, grow if needed
     BufSize = 4 * 1024 * 1024;
     Buf = AllocatePool(BufSize);
     if (Buf == NULL) {
@@ -354,8 +349,8 @@ PxeTftpReadFile(
         FALSE,
         &BufSize,
         NULL,
-        &ServerIp,                 // NOTE: EFI_IP_ADDRESS*
-        (UINT8 *)FileNameAscii,    // NOTE: UINT8*
+        &ServerIp,
+        (UINT8 *)FileNameAscii,
         NULL,
         FALSE
     );
@@ -393,6 +388,7 @@ PxeTftpReadFile(
     Print(L"[uefi1] PXE downloaded '%a' size=%lu bytes\n", FileNameAscii, (UINT64)BufSize);
     return EFI_SUCCESS;
 }
+
 EFI_STATUS
 EFIAPI
 UefiMain (
@@ -412,6 +408,7 @@ UefiMain (
     MEMMAP_DEVICE_PATH_WITH_END      MemDp;
     EFI_HANDLE                       Uefi2Handle    = NULL;
 
+    BOOLEAN                          NetBoot = FALSE;
     Print(L"[uefi1] UefiMain() start. Loading encrypted %s via MemMap DP\n",
           UEFI2_ENC_PATH);
 
@@ -437,44 +434,38 @@ UefiMain (
         (VOID**)&Sfsp
     );
 
-    if (!EFI_ERROR(Status)) {
-        // Disk/ESP path
+    if (!EFI_ERROR(Status) && Sfsp != NULL) {
+        Print(L"[uefi1] SimpleFileSystem present. Loading from ESP...\n");
+
         Status = Sfsp->OpenVolume(Sfsp, &Root);
-        if (EFI_ERROR(Status)) {
+        if (EFI_ERROR(Status) || Root == NULL) {
             Print(L"[uefi1] OpenVolume() failed: %r\n", Status);
             return Status;
         }
 
         Status = LoadFileToBuffer(Root, UEFI2_ENC_PATH, &EncBuffer, &EncSize);
         if (EFI_ERROR(Status)) {
-            Print(L"[uefi1] FS load %s failed: %r\n", UEFI2_ENC_PATH, Status);
+            Print(L"[uefi1] FS LoadFileToBuffer(%s) failed: %r\n", UEFI2_ENC_PATH, Status);
             return Status;
         }
 
+        Print(L"[uefi1] FS loaded encrypted file: EncBuffer=0x%lx EncSize=%u\n",
+              (UINT64)(UINTN)EncBuffer, (UINT32)EncSize);
+
     } else if (Status == EFI_UNSUPPORTED) {
-        // PXE path
-        Status = PxeTftpReadFile((CONST UINT8 *)"efi/secondLoader.enc", &EncBuffer, &EncSize);
+        Print(L"[uefi1] No SimpleFileSystem (PXE boot). Downloading via PXE TFTP...\n");
+        NetBoot = TRUE;
+        Status = PxeTftpDownloadFile((CONST UINT8 *)STAGE2_ENC_TFTP_PATH, &EncBuffer, &EncSize);
         if (EFI_ERROR(Status)) {
-            Print(L"[uefi1] PXE load secondLoader.enc failed: %r\n", Status);
+            Print(L"[uefi1] PXE download failed: %r\n", Status);
             return Status;
         }
+
+        Print(L"[uefi1] PXE loaded encrypted file: EncBuffer=0x%lx EncSize=%u\n",
+              (UINT64)(UINTN)EncBuffer, (UINT32)EncSize);
 
     } else {
         Print(L"[uefi1] HandleProtocol(SimpleFileSystem) failed: %r\n", Status);
-        return Status;
-    }
-    Status = Sfsp->OpenVolume(Sfsp, &Root);
-    if (EFI_ERROR(Status)) {
-        Print(L"[uefi1] OpenVolume() failed: %r\n", Status);
-        return Status;
-    }
-
-    //
-    // Load the encrypted uefi2 image into memory
-    //
-    Status = LoadFileToBuffer(Root, UEFI2_ENC_PATH, &EncBuffer, &EncSize);
-    if (EFI_ERROR(Status)) {
-        Print(L"[uefi1] Failed to load encrypted %s: %r\n", UEFI2_ENC_PATH, Status);
         return Status;
     }
 
@@ -503,6 +494,7 @@ UefiMain (
     //
     // Build MemMap Device Path describing the in-memory decrypted image
     //
+    ZeroMem(&MemDp, sizeof(MemDp));
     MemDp.MemMap.Header.Type    = HARDWARE_DEVICE_PATH;
     MemDp.MemMap.Header.SubType = HW_MEMMAP_DP;
 
@@ -535,6 +527,26 @@ UefiMain (
     if (EFI_ERROR(Status)) {
         Print(L"[uefi1] LoadImage(uefi2 via MemMap DP) failed: %r\n", Status);
         return Status;
+    }
+
+    EFI_LOADED_IMAGE_PROTOCOL *Uefi2Loaded = NULL;
+    CHAR16 *Opt = NULL;
+
+    CONST CHAR16 *Src = NetBoot ? L"BOOT=PXE" : L"BOOT=FS";
+
+    Opt = AllocateCopyPool((StrLen(Src) + 1) * sizeof(CHAR16), Src);
+    if (Opt != NULL) {
+        Status = gBS->HandleProtocol(Uefi2Handle, &gEfiLoadedImageProtocolGuid, (VOID**)&Uefi2Loaded);
+        if (!EFI_ERROR(Status) && Uefi2Loaded != NULL) {
+            Uefi2Loaded->LoadOptions     = Opt;
+            Uefi2Loaded->LoadOptionsSize = (UINT32)((StrLen(Opt) + 1) * sizeof(CHAR16));
+            Print(L"[uefi1] Set uefi2 LoadOptions: %s\n", Opt);
+        } else {
+            Print(L"[uefi1] Cannot set uefi2 LoadOptions: %r\n", Status);
+            FreePool(Opt);
+        }
+    } else {
+        Print(L"[uefi1] AllocateCopyPool for uefi2 LoadOptions failed\n");
     }
 
     Print(L"[uefi1] LoadImage(uefi2) OK, starting...\n");
