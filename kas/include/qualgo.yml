@@ -3,10 +3,13 @@ header:
 
 repos:
   uav-qualgo:
+    url: git@github.com:uneycom/uav-yocto-build.git
+    path: repos/uav-qualgo
+    branch: dev_boot-over-eth
     layers:
-      layers/meta-edk2:
-      layers/meta-skytrack-kernel:
-      layers/meta-skytrack-secureboot:
+      poky/meta-edk2:
+      poky/meta-skytrack-kernel:
+      poky/meta-skytrack-secureboot:
 
   meta-rtlwifi:
     path: repos/meta-rtlwifi
@@ -45,3 +48,5 @@ local_conf_header:
     IMAGE_INSTALL:remove = " dropbear"
 
     IMAGE_INSTALL:append = " edk2-bootloader-firmware uefi1-prebuilt"
+
+    BB_NO_NETWORK = "1"
