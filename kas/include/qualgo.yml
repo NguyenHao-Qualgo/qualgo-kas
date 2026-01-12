@@ -48,5 +48,3 @@ local_conf_header:
     IMAGE_INSTALL:remove = " dropbear"
 
     IMAGE_INSTALL:append = " edk2-bootloader-firmware uefi1-prebuilt"
-
-    BB_NO_NETWORK = "1"

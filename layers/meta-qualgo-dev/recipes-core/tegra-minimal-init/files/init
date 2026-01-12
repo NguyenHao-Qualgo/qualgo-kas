@@ -1,0 +1,142 @@
+#!/bin/sh
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+mount -t proc proc -o nosuid,nodev,noexec /proc
+mount -t devtmpfs none -o nosuid /dev
+mount -t sysfs sysfs -o nosuid,nodev,noexec /sys
+mount -t efivarfs efivarfs -o nosuid,nodev,noexec /sys/firmware/efi/efivars 2>/dev/null || true
+
+log() { echo "[initramfs] $*"; }
+
+[ ! -f /etc/platform-preboot ] || . /etc/platform-preboot
+
+rootdev=""
+opt="rw"
+wait=""
+fstype="auto"
+NFSROOT=""
+NFSOPTS=""
+
+for bootarg in $(cat /proc/cmdline 2>/dev/null); do
+    case "$bootarg" in
+        root=*) rootdev="${bootarg##root=}" ;;
+        ro) opt="ro" ;;
+        rootwait|netdevwait) wait="yes" ;;
+        rootfstype=*) fstype="${bootarg##rootfstype=}" ;;
+        nfsroot=*) NFSROOT="${bootarg##nfsroot=}" ;;
+        nfsopts=*) NFSOPTS="${bootarg##nfsopts=}" ;;
+    esac
+done
+
+NFSOPTS="${NFSOPTS:-vers=3,tcp,nolock,timeo=50,retrans=2}"
+
+fail_debug() {
+    log "DEBUG: ifaces=$(ls /sys/class/net 2>/dev/null | tr '\n' ' ')"
+    ip -br link 2>/dev/null || true
+    ip -br addr 2>/dev/null || true
+    ip route 2>/dev/null || true
+    log "DEBUG: dmesg tail:"
+    dmesg | tail -n 30 2>/dev/null || true
+}
+
+
+modprobe -v nvme 2>/dev/null || true
+
+modprobe -v phy_tegra194_p2u 2>/dev/null || true
+modprobe -v pcie_tegra194    2>/dev/null || true
+modprobe -v pci_tegra        2>/dev/null || true
+
+sleep 0.5
+
+modprobe -v r8168 2>/dev/null || true
+
+probe_nfs() {
+    modprobe -v sunrpc 2>/dev/null || true
+    modprobe -v lockd  2>/dev/null || true
+    modprobe -v nfs    2>/dev/null || true
+    modprobe -v nfsv3  2>/dev/null || true
+    modprobe -v nfsv4  2>/dev/null || true
+}
+
+bringup_net() {
+    t=0
+    IFACE=""
+    while [ $t -lt 150 ]; do
+        IFACE="$(ls /sys/class/net 2>/dev/null | grep -v '^lo$' | head -n 1 || true)"
+        [ -n "$IFACE" ] && break
+        sleep 0.1
+        t=$((t+1))
+    done
+
+    [ -n "$IFACE" ] || { log "ERROR: no network interface found"; return 1; }
+
+    log "Using IFACE=$IFACE"
+    ip link set "$IFACE" up 2>/dev/null || true
+
+    if [ -f "/sys/class/net/$IFACE/carrier" ]; then
+        j=0
+        while [ $j -lt 50 ]; do
+            [ "$(cat /sys/class/net/$IFACE/carrier 2>/dev/null)" = "1" ] && break
+            sleep 0.1
+            j=$((j+1))
+        done
+        log "$IFACE carrier=$(cat /sys/class/net/$IFACE/carrier 2>/dev/null || echo '?')"
+    fi
+
+    if command -v udhcpc >/dev/null 2>&1; then
+        log "DHCP: udhcpc on $IFACE"
+        udhcpc -i "$IFACE" -n -t 10 -T 3 -q || true
+    else
+        log "WARNING: udhcpc not available"
+    fi
+
+    ip -4 addr show dev "$IFACE" 2>/dev/null | grep -q "inet " && log "DHCP: IPv4 configured" || log "DHCP: no IPv4"
+    return 0
+}
+
+switch_to_rootfs() {
+    [ ! -f /etc/platform-pre-switchroot ] || . /etc/platform-pre-switchroot
+    log "Switching to rootfs..."
+    mount --move /sys  /mnt/sys
+    mount --move /proc /mnt/proc
+    mount --move /dev  /mnt/dev
+    exec switch_root /mnt /sbin/init
+}
+
+if [ -n "$NFSROOT" ] || [ "$rootdev" = "/dev/nfs" ]; then
+    [ -n "$NFSROOT" ] || { log "ERROR: root=/dev/nfs but missing nfsroot="; exec sh; }
+
+    bringup_net || { fail_debug; exec sh; }
+    probe_nfs
+
+    mkdir -p /mnt
+    log "Mounting NFS root..."
+    mount -t nfs -o "$NFSOPTS" "$NFSROOT" /mnt && switch_to_rootfs
+
+    log "ERROR: NFS mount failed"
+    fail_debug
+    exec sh
+fi
+
+[ -n "$rootdev" ] || { log "ERROR: missing root="; exec sh; }
+
+if [ -n "$wait" ] && [ ! -b "$rootdev" ]; then
+    log "Waiting for $rootdev..."
+    while true; do
+        [ -b "$rootdev" ] && break
+        sleep 0.1
+    done
+fi
+
+mkdir -p /mnt
+log "Mounting local root: $rootdev"
+count=0
+while [ $count -lt 5 ]; do
+    mount -t "$fstype" -o "$opt" "$rootdev" /mnt && switch_to_rootfs
+    sleep 1
+    count=$((count + 1))
+done
+
+log "ERROR: failed to mount root"
+fail_debug
+exec sh
