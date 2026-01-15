@@ -27,3 +27,5 @@ local_conf_header:
     # INHERIT += "rm_work"
     PARALLEL_MAKE = " -j 4"
     BB_NUMBER_THREADS = " 4"
+
+    # QUALGO_FEATURES = " qualgo-boot-pxe"
