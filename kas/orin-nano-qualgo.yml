@@ -5,12 +5,17 @@ header:
     - kas/include/tegra.yml
     - kas/include/swupdate.yml
     - kas/include/ros.yml
-    - kas/include/qualgo.yml
+    # - kas/include/qualgo.yml
 
 distro: tegrademo
 machine: jetson-orin-nano-devkit-nvme
 target:
   - demo-image-base
+
+repos:
+  qualgo-dev:
+    layers:
+      layers/meta-qualgo-dev:
 
 defaults:
   repos:
@@ -28,4 +33,6 @@ local_conf_header:
     PARALLEL_MAKE = " -j 4"
     BB_NUMBER_THREADS = " 4"
 
-    # QUALGO_FEATURES = " qualgo-boot-pxe"
+    QUALGO_FEATURES = " qualgo-boot-pxe"
+    IMAGE_CLASSES += "shared_dataimg"
+    IMAGE_FSTYPES += "shared_dataimg"
