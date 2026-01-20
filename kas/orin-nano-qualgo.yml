@@ -13,9 +13,9 @@ target:
   - demo-image-base
 
 repos:
-  qualgo-dev:
+  nvidia-dev:
     layers:
-      layers/meta-qualgo-dev:
+      layers/meta-nvidia-dev:
 
 defaults:
   repos:

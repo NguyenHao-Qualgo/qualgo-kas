@@ -1,0 +1,33 @@
+header:
+  version: 14
+  includes:
+    - kas/include/base.yml
+
+repos:
+  meta-arm:
+    path: repos/meta-arm
+    url: https://git.yoctoproject.org/git/meta-arm
+    layers:
+      meta-arm:
+      meta-arm-bsp:
+      meta-arm-toolchain:
+  qualgo-dev:
+    layers:
+      layers/meta-qualgo-dev:
+
+defaults:
+  repos:
+    branch: scarthgap
+
+local_conf_header:
+  qemu: |
+    MACHINE = "qemuarm64-secureboot"
+    INIT_MANAGER = "systemd"
+
+    EXTRA_IMAGE_FEATURES ?= "allow-empty-password empty-root-password allow-root-login"
+    IMAGE_INSTALL:append = " nfs-utils ganesha"
+    INHERIT += "rm_work"
+    PARALLEL_MAKE = " -j 4"
+    BB_NUMBER_THREADS = " 4"
+
+    TOOLCHAIN_HOST_TASK:append = " nativesdk-hitl"

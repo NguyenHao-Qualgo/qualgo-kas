@@ -1,0 +1,18 @@
+header:
+  version: 14
+  includes:
+    - kas/include/base.yml
+
+defaults:
+  repos:
+    branch: scarthgap
+
+local_conf_header:
+  qemu: |
+    MACHINE = "qemuarm64"
+    IMAGE_FSTYPES:append = " ext4"
+
+    EXTRA_IMAGE_FEATURES ?= "allow-empty-password empty-root-password allow-root-login"
+    INHERIT += "rm_work"
+    PARALLEL_MAKE = " -j 4"
+    BB_NUMBER_THREADS = " 4"
