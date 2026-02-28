@@ -1,0 +1,121 @@
+header:
+  version: 14
+  includes:
+    - kas/include/base.yml
+
+machine: raspberrypi5
+distro: poky
+target:
+  - core-image-base
+
+repos:
+  meta-raspberrypi:
+    path: repos/meta-raspberrypi
+    url: git@github.com:NguyenHao-Qualgo/meta-raspberrypi.git
+    branch: fix_imx708_scarthgap
+
+  meta-yocto:
+    url: git://git.yoctoproject.org/git/meta-yocto.git
+    path: repos/meta-yocto
+    layers:
+      meta-poky:
+      meta-yocto-bsp:
+
+
+  meta-openembedded:
+    layers:
+      meta-multimedia:
+
+  meta-test-rpi:
+    path: meta-test-rpi
+
+defaults:
+  repos:
+    branch: scarthgap
+    
+local_conf_header:
+  standard: |
+    CONF_VERSION = "2"
+    PACKAGE_CLASSES = "package_rpm"
+    SDKMACHINE = "x86_64"
+    USER_CLASSES = "buildstats"
+    PATCHRESOLVE = "noop"
+  debug-tweaks: |
+    EXTRA_IMAGE_FEATURES ?= "allow-empty-password empty-root-password allow-root-login"
+  diskmon: |
+    BB_DISKMON_DIRS = "\
+        STOPTASKS,${TMPDIR},1G,100K \
+        STOPTASKS,${DL_DIR},1G,100K \
+        STOPTASKS,${SSTATE_DIR},1G,100K \
+        STOPTASKS,/tmp,100M,100K \
+        HALT,${TMPDIR},100M,1K \
+        HALT,${DL_DIR},100M,1K \
+        HALT,${SSTATE_DIR},100M,1K \
+        HALT,/tmp,10M,1K"
+  license: |
+    # Uncomment next line to allow the license
+    # See: linux-firmware-rpidistro in docs/ipcompliance.md
+    #LICENSE_FLAGS_ACCEPTED = "synaptics-killswitch"
+
+  custom: |
+    # INHERIT += "rm_work"
+
+    PIPEWIRE_SESSION_MANAGER = "wireplumber"
+
+    DISTRO_FEATURES:append = " systemd dbus ncurses alsa wifi bluetooth zeroconf usbhost pipewire polkit"
+    DISTRO_FEATURES:remove = "sysvinit usbgadget ptest xen x11 pulseaudio"
+
+    INIT_MANAGER = "systemd"
+
+    DISTRO_FEATURES:append = " opengl"
+
+    DISTRO_FEATURES:append = " acl xattr pam"
+    PREFERRED_PROVIDER_virtual/refpolicy = "refpolicy-mls"
+
+    LINUX_KERNEL_TYPE = "preempt-rt"
+    DISPMANX_OFFLINE = "1"
+    DISABLE_OVERSCAN = "1"
+    DISABLE_RPI_BOOT_LOGO = "1"
+    DISABLE_SPLASH = "1"
+    IMAGE_FEATURES:remove = "splash"
+
+    ENABLE_I2C = "1"
+    VIDEO_CAMERA = "1"
+    RASPBERRYPI_CAMERA_V3 = "1"
+    KERNEL_MODULE_AUTOLOAD:rpi:append = " i2c-dev i2c-bcm2708"
+
+    # PREFERRED_PROVIDER_ffmpeg = "ffmpeg"
+    # PREFERRED_PROVIDER_libnss-mdns = "mdns"
+    # PREFERRED_PROVIDER_jpeg = "libjpeg-turbo"
+    # PREFERRED_PROVIDER_jpeg-native = "libjpeg-turbo-native"
+    LICENSE_FLAGS_ACCEPTED += " synaptics-killswitch commercial"
+
+    PACKAGECONFIG:append:pn-libcamera = " gst"
+
+    IMAGE_INSTALL:append = " \
+        \
+        alsa-utils \
+        \
+        gdb \
+        ldd \
+        strace \
+        libcamera \
+        libcamera-gst \
+        libcamera-apps \
+        v4l-utils \
+        i2c-tools \
+        networkmanager \
+        gstreamer1.0 \
+        gstreamer1.0-plugins-base \
+        gstreamer1.0-plugins-good \
+        gstreamer1.0-plugins-bad \
+        gstreamer1.0-plugins-ugly \
+    "
+
+    PARALLEL_MAKE = " -j 16"
+    BB_NUMBER_THREADS = " 16"
+    INSANE_SKIP:icu-src:append = " buildpaths"
+    ENABLE_UART = "1"
+    INIT_MANAGER = "systemd"
+    DISTRO_FEATURES:append = " wifi"
+    IMAGE_FEATURES:append = " ssh-server-dropbear"
